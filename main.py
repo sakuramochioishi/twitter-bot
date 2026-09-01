@@ -1,115 +1,103 @@
-import asyncio
 import os
 import discord
+from discord.ext import tasks, commands
 from discord import app_commands
-from discord.ext import commands, tasks
+import asyncpg
+import feedparser
+import aiohttp
 from dotenv import load_dotenv
-import psycopg2
-from twikit import Client
 
 load_dotenv()
+TOKEN = os.getenv('DISCORD_TOKEN')
+DATABASE_URL = os.getenv('DATABASE_URL')
 
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+class RSSBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=discord.Intents.default())
+        self.pool = None
 
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-x_client = Client("ja")
+    async def setup_hook(self):
+        self.pool = await asyncpg.create_pool(DATABASE_URL)
+        
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS rss_feeds (
+                    id SERIAL PRIMARY KEY,
+                    guild_id BIGINT,
+                    channel_id BIGINT,
+                    rss_url TEXT,
+                    last_entry_link TEXT
+                )
+            ''')
+            
+        self.check_rss.start()
+        await self.tree.sync()
 
-def init_db():
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS follows (
-            id SERIAL PRIMARY KEY,
-            channel_id BIGINT,
-            target_username TEXT,
-            last_tweet_id TEXT
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    async def process_rss_check(self):
+        """RSSをチェックして更新があれば通知する共通処理"""
+        async with self.pool.acquire() as conn:
+            feeds = await conn.fetch('SELECT id, channel_id, rss_url, last_entry_link FROM rss_feeds')
+            
+            async with aiohttp.ClientSession() as session:
+                for feed in feeds:
+                    feed_id, channel_id, rss_url, last_link = feed
+                    
+                    try:
+                        async with session.get(rss_url) as resp:
+                            xml_data = await resp.text()
+                            parsed = feedparser.parse(xml_data)
+
+                        if not parsed.entries:
+                            continue
+
+                        latest_entry = parsed.entries[0]
+                        
+                        # 初回登録時などで last_entry_link が NULL の場合の対策
+                        if last_link is None:
+                            await conn.execute('UPDATE rss_feeds SET last_entry_link = $1 WHERE id = $2', latest_entry.link, feed_id)
+                            continue
+
+                        # 前回保存したリンクと異なる場合（新しい投稿）に通知
+                        if latest_entry.link != last_link:
+                            channel = self.get_channel(channel_id)
+                            if channel:
+                                await channel.send(f"新しい投稿がありました！\n{latest_entry.link}")
+                            
+                            await conn.execute('UPDATE rss_feeds SET last_entry_link = $1 WHERE id = $2', latest_entry.link, feed_id)
+                    except Exception as e:
+                        print(f"RSS fetch error ({rss_url}): {e}")
+
+    @tasks.loop(minutes=10)
+    async def check_rss(self):
+        await self.process_rss_check()
+
+    @check_rss.before_loop
+    async def before_check_rss(self):
+        await self.wait_until_ready()
+        # 起動時に一度即座にチェックを実行
+        await self.process_rss_check()
+
+bot = RSSBot()
 
 @bot.event
 async def on_ready():
-    init_db()
-    print(f"Logged in as {bot.user}")
-    
-    # ファイル名を cookies-x-com.json に修正
-    try:
-        await x_client.load_cookies('cookies-x-com.json')
-        print("X client logged in via cookies.")
-    except Exception as e:
-        print(f"Failed to load X cookies: {e}")
+    print(f'Logged in as {bot.user.name}')
 
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s)")
-    except Exception as e:
-        print(e)
+@bot.tree.command(name="follow", description="RSSフィードをチャンネルに登録します")
+@app_commands.describe(rss_url="RSS.appで生成したURL", channel="通知を送るチャンネル")
+async def follow(interaction: discord.Interaction, rss_url: str, channel: discord.TextChannel):
+    async with bot.pool.acquire() as conn:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(rss_url) as resp:
+                xml_data = await resp.text()
+                parsed = feedparser.parse(xml_data)
+                last_link = parsed.entries[0].link if parsed.entries else None
 
-    check_tweets_loop.start()
+        await conn.execute('''
+            INSERT INTO rss_feeds (guild_id, channel_id, rss_url, last_entry_link)
+            VALUES ($1, $2, $3, $4)
+        ''', interaction.guild_id, channel.id, rss_url, last_link)
 
-@bot.tree.command(name="follow", description="指定したXアカウントの監視を登録します")
-@app_commands.describe(
-    username="監視したいXのユーザー名（@なし）",
-    channel="通知を送るチャンネル",
-)
-async def follow(interaction: discord.Interaction, username: str, channel: discord.TextChannel):
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO follows (channel_id, target_username, last_tweet_id) VALUES (%s, %s, %s)",
-        (channel.id, username, ""),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    await interaction.response.send_message(
-        f"@{username} の監視を {channel.mention} に設定しました！", ephemeral=True
-    )
-
-@tasks.loop(minutes=3)
-async def check_tweets_loop():
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    cur.execute("SELECT id, channel_id, target_username, last_tweet_id FROM follows")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    for row in rows:
-        db_id, channel_id, username, last_tweet_id = row
-        try:
-            user = await x_client.get_user_by_screen_name(username)
-            tweets = await user.get_tweets("tweets", count=1)
-
-            if not tweets:
-                continue
-
-            latest_tweet = tweets[0]
-            latest_id = latest_tweet.id
-            tweet_url = f"https://twitter.com/{username}/status/{latest_id}"
-
-            if str(latest_id) != str(last_tweet_id):
-                if last_tweet_id != "":
-                    channel = bot.get_channel(channel_id)
-                    if channel:
-                        await channel.send(tweet_url)
-
-                conn = psycopg2.connect(DATABASE_URL)
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE follows SET last_tweet_id = %s WHERE id = %s",
-                    (str(latest_id), db_id),
-                )
-                conn.commit()
-                cur.close()
-                conn.close()
-
-        except Exception as e:
-            print(f"Error checking @{username}: {e}")
+    await interaction.response.send_message(f"{channel.mention} に {rss_url} の通知を登録しました！", ephemeral=True)
 
 bot.run(TOKEN)
